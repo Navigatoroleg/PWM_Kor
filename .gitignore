@@ -1,0 +1,20 @@
+# Сборка CubeIDE: перегенерируется при каждой сборке
+Debug/
+Release/
+*.o
+*.d
+*.su
+*.cyclo
+*.elf
+*.map
+*.list
+*.hex
+*.bin
+
+# Личные настройки CubeIDE и отладки (в .launch номер ST-LINK этого ПК)
+.settings/
+*.launch
+
+# Резервные копии
+*.bak*
+*~
