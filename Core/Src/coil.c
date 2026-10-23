@@ -18,6 +18,14 @@
 #error "COIL_OS: 1...16, точка хранится в 16 битах"
 #endif
 
+#if (COIL_FILTER != COIL_FILTER_NONE) && (COIL_FILTER != COIL_FILTER_WINDOW) && (COIL_FILTER != COIL_FILTER_DAMPING)
+#error "COIL_FILTER: COIL_FILTER_NONE, COIL_FILTER_WINDOW или COIL_FILTER_DAMPING"
+#endif
+
+// Длительности фильтров, которые реально работают: невыбранный фильтр — 0, то есть выключен
+#define COIL_AVG_USED_S     ((COIL_FILTER == COIL_FILTER_WINDOW) ? (double)COIL_AVG_S : 0.0)
+#define COIL_TAU_USED_S     ((COIL_FILTER == COIL_FILTER_DAMPING) ? (double)COIL_TAU_S : 0.0)
+
 // Блок = половина кольца DMA: 64 точки = 12,8 мс при 5 кГц. На каждый блок — один расчёт, шаг задаёт кварц таймера
 #define COIL_BLOCK          64U
 #define COIL_DMA_WORDS      (2U * COIL_BLOCK * COIL_OS)
@@ -67,6 +75,12 @@ typedef struct
   double   dt_damped_us;  // Δt после демпфирования
   double   dt_shown_us;   // после демпфирования минус ноль
   double   flow_kgmin;    // расход с отсечкой
+  uint8_t  zero_state;    // COIL_ZERO_OFF / WAIT / ACC / DONE
+  uint32_t zero_left_s;   // ожидание: сколько секунд осталось; накопление: сколько секунд накоплено
+  uint32_t zero_count;    // сколько раз ноль записан — печать видит новый ноль по смене счётчика
+  double   zero_us;       // действующий ноль
+  double   zero_sd_us;    // разброс сырых Δt при накоплении нуля
+  uint32_t zero_n;        // сколько замеров вошло в ноль
   uint32_t fit_points;
   uint32_t clip1;
   uint32_t clip2;
@@ -100,6 +114,31 @@ static uint32_t coil_theta_at;
 static uint8_t coil_theta_ok;
 static double coil_lock_hz;
 static double coil_freq_alpha;
+
+// Автообнуление: ожидание устоявшегося сигнала, потом среднее сырых Δt за COIL_ZERO_AVG_S.
+// Время считается в блоках по 12,8 мс — так же строго, как демпфирование
+#define COIL_ZERO_OFF       0U   // автообнуление выключено, ноль = COIL_ZERO_US
+#define COIL_ZERO_WAIT      1U   // ждём COIL_ZERO_DELAY_S нормального сигнала
+#define COIL_ZERO_ACC       2U   // копим сырые Δt
+#define COIL_ZERO_DONE      3U   // ноль записан
+static uint8_t coil_zero_state = (COIL_ZERO_AVG_S > 0.0) ? COIL_ZERO_WAIT : COIL_ZERO_OFF;
+static uint32_t coil_zero_blocks;   // блоков в текущем этапе (ожидание или накопление)
+static double coil_zero_us = COIL_ZERO_US;
+static double coil_zero_sd_us;
+static uint32_t coil_zero_n;
+static uint32_t coil_zero_count;
+// Среднее и разброс накопления по Велфорду: без хранения самих замеров
+static double coil_zero_mean;
+static double coil_zero_m2;
+
+// Скользящее среднее сырых Δt за COIL_AVG_S секунд: кольцо значений по блокам и их сумма.
+// Буфер на 30 с (2400 блоков по 12,8 мс); COIL_AVG_S больше — обрезается до 30 с
+#define COIL_AVG_MAX        2400U
+static float coil_avg_buf[COIL_AVG_MAX];
+static uint32_t coil_avg_len;       // размер окна в блоках, из COIL_AVG_S
+static uint32_t coil_avg_head;      // куда писать следующее значение
+static uint32_t coil_avg_count;     // сколько значений уже в окне (после запуска окно заполняется не сразу)
+static double coil_avg_sum;         // сумма значений в окне
 
 static CoilSnapshot coil_snap;
 // CDC отправляет из буфера без копии, поэтому строка живёт до следующей печати
@@ -402,6 +441,95 @@ static void Coil_Lost(void)
 {
   coil_have_damped = 0U;
   coil_theta_ok = 0U;
+  // окно среднего — с нуля: старые Δt относятся к сигналу до пропажи
+  coil_avg_count = 0U;
+  coil_avg_head = 0U;
+  coil_avg_sum = 0.0;
+  // обнуление не закончено — начнётся заново, когда сигнал вернётся
+  if ((coil_zero_state == COIL_ZERO_WAIT) || (coil_zero_state == COIL_ZERO_ACC))
+  {
+    coil_zero_state = COIL_ZERO_WAIT;
+    coil_zero_blocks = 0U;
+  }
+}
+
+// Скользящее среднее: новое Δt в окно, самое старое — из окна, возвращает среднее окна.
+// steps > 1 — пропущенные блоки: значение кладётся steps раз, чтобы окно оставалось в секундах.
+// COIL_AVG_S = 0 — без усреднения, Δt возвращается как есть
+static double Coil_Average(double dt_us, uint32_t steps)
+{
+  uint32_t index;
+
+  if (coil_avg_len <= 1U)
+  {
+    return dt_us;
+  }
+  for (index = 0U; index < steps; index++)
+  {
+    if (coil_avg_count == coil_avg_len)
+    {
+      coil_avg_sum -= coil_avg_buf[coil_avg_head];   // окно полное — самое старое уходит
+    }
+    else
+    {
+      coil_avg_count++;                              // окно ещё заполняется
+    }
+    coil_avg_buf[coil_avg_head] = (float)dt_us;
+    coil_avg_sum += (float)dt_us;                    // в сумму — ровно то, что лежит в буфере
+    coil_avg_head = (coil_avg_head + 1U) % coil_avg_len;
+  }
+  // раз в полный круг сумма пересчитывается заново — без накопления ошибки округления
+  if (coil_avg_head == 0U)
+  {
+    coil_avg_sum = 0.0;
+    for (index = 0U; index < coil_avg_count; index++)
+    {
+      coil_avg_sum += coil_avg_buf[index];
+    }
+  }
+  return coil_avg_sum / (double)coil_avg_count;
+}
+
+// Автообнуление на один расчёт: сначала ждём устоявшегося сигнала, потом копим сырые Δt.
+// steps — сколько блоков прошло (обычно 1): время этапов идёт в блоках, как и демпфирование
+static void Coil_Zero(double dt_us, uint32_t steps)
+{
+  const uint32_t wait_blocks = (uint32_t)(COIL_ZERO_DELAY_S / COIL_BLOCK_S + 0.5);
+  const uint32_t avg_blocks = (uint32_t)(COIL_ZERO_AVG_S / COIL_BLOCK_S + 0.5);
+  double delta;
+
+  if (coil_zero_state == COIL_ZERO_WAIT)
+  {
+    coil_zero_blocks += steps;
+    if (coil_zero_blocks >= wait_blocks)
+    {
+      // ожидание прошло — начинаем копить с чистого листа
+      coil_zero_state = COIL_ZERO_ACC;
+      coil_zero_blocks = 0U;
+      coil_zero_n = 0U;
+      coil_zero_mean = 0.0;
+      coil_zero_m2 = 0.0;
+    }
+    return;
+  }
+  if (coil_zero_state != COIL_ZERO_ACC)
+  {
+    return;
+  }
+  // Велфорд: среднее и сумма квадратов отклонений обновляются на каждом замере
+  coil_zero_n++;
+  delta = dt_us - coil_zero_mean;
+  coil_zero_mean += delta / (double)coil_zero_n;
+  coil_zero_m2 += delta * (dt_us - coil_zero_mean);
+  coil_zero_blocks += steps;
+  if (coil_zero_blocks >= avg_blocks)
+  {
+    // накоплено — среднее становится нулём
+    coil_zero_us = coil_zero_mean;
+    coil_zero_sd_us = (coil_zero_n > 1U) ? sqrt(coil_zero_m2 / (double)(coil_zero_n - 1U)) : 0.0;
+    coil_zero_count++;
+    coil_zero_state = COIL_ZERO_DONE;
+  }
 }
 
 // Один расчёт на конец данных end. steps — сколько блоков прошло с прошлого расчёта (обычно 1)
@@ -411,7 +539,7 @@ static void Coil_Calc(uint32_t end, uint32_t steps, CoilSnapshot *snap)
   float period;
   uint32_t count;
   float omega;
-  double freq, dphi, dt_us, amp1, amp2, alpha, theta, lock, shown, flow;
+  double freq, dphi, dt_us, avg_us, amp1, amp2, alpha, theta, lock, shown, flow;
   int32_t snr1, snr2;
   CoilFit f1, f2;
 
@@ -470,19 +598,23 @@ static void Coil_Calc(uint32_t end, uint32_t steps, CoilSnapshot *snap)
   while (dphi <= -COIL_PI) { dphi += 2.0 * COIL_PI; }
   dt_us = dphi / (2.0 * COIL_PI * coil_lock_hz) * 1e6;
 
-  // демпфирование с шагом в блоках: пропущенные блоки учитываются степенью
+  // скользящее среднее за COIL_AVG_S, затем демпфирование с шагом в блоках:
+  // пропущенные блоки учитываются степенью
+  avg_us = Coil_Average(dt_us, steps);
   if (coil_have_damped == 0U)
   {
-    coil_damped_us = dt_us;
+    coil_damped_us = avg_us;
     coil_have_damped = 1U;
   }
   else
   {
     alpha = (steps == 1U) ? coil_alpha : 1.0 - pow(1.0 - coil_alpha, (double)steps);
-    coil_damped_us += alpha * (dt_us - coil_damped_us);
+    coil_damped_us += alpha * (avg_us - coil_damped_us);
   }
+  // автообнуление копит сырые Δt — как кнопка «Обнулить» в Qt
+  Coil_Zero(dt_us, steps);
   // расход по демпфированному Δt минус ноль, малый — в ноль
-  shown = coil_damped_us - COIL_ZERO_US;
+  shown = coil_damped_us - coil_zero_us;
   flow = (fabs(shown) < COIL_CUTOFF_US) ? 0.0 : COIL_K_KGMIN_PER_US * shown;
   snap->lock_hz = coil_lock_hz;
   snap->dt_shown_us = shown;
@@ -516,8 +648,14 @@ static void Coil_CalcTask(void *argument)
   // --- Подготовка: один раз при старте --------------------------------------------------------
   // Коэффициенты экспоненциального сглаживания на ОДИН блок (12,8 мс): α = 1 − e^(−T/τ).
   // Считаются один раз — дальше шаг демпфирования строго одинаковый. τ = 0 — без сглаживания: α = 1
-  coil_alpha = (COIL_TAU_S > 0.0) ? 1.0 - exp(-COIL_BLOCK_S / COIL_TAU_S) : 1.0;              // для Δt
-  coil_freq_alpha = (COIL_FREQ_TAU_S > 0.0) ? 1.0 - exp(-COIL_BLOCK_S / COIL_FREQ_TAU_S) : 1.0; // для частоты
+  coil_alpha = (COIL_TAU_USED_S > 0.0) ? 1.0 - exp(-COIL_BLOCK_S / COIL_TAU_USED_S) : 1.0;    // для Δt
+  coil_freq_alpha = (COIL_FREQ_TAU_S > 0.0) ? 1.0 - exp(-COIL_BLOCK_S / COIL_FREQ_TAU_S) : 1.0;
+  // окно скользящего среднего в блоках: COIL_AVG_S / 12,8 мс, не больше буфера на 30 с
+  coil_avg_len = (uint32_t)(COIL_AVG_USED_S / COIL_BLOCK_S + 0.5);
+  if (coil_avg_len > COIL_AVG_MAX)
+  {
+    coil_avg_len = COIL_AVG_MAX;
+  } // для частоты
 
   // Счётчик тактов ядра DWT CYCCNT: 168 МГц, по нему меряется время расчёта
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;   // разрешить блок трассировки, в нём DWT
@@ -561,6 +699,14 @@ static void Coil_CalcTask(void *argument)
     Coil_TrackCrossings(coil_done, end);            // новые точки К1 → уровень, размах, переходы через ноль
     coil_done = end;                                // эти точки обработаны
     Coil_Calc(end, pending, &snap);                 // частота, подгонка синуса К1/К2, Δt, демпфирование, расход → snap
+    snap.zero_state = coil_zero_state;              // этап автообнуления — для печати
+    snap.zero_left_s = (coil_zero_state == COIL_ZERO_WAIT)
+                       ? (uint32_t)(COIL_ZERO_DELAY_S - (double)coil_zero_blocks * COIL_BLOCK_S + 0.999)  // осталось ждать
+                       : (uint32_t)((double)coil_zero_blocks * COIL_BLOCK_S);                           // уже накоплено
+    snap.zero_count = coil_zero_count;
+    snap.zero_us = coil_zero_us;
+    snap.zero_sd_us = coil_zero_sd_us;
+    snap.zero_n = coil_zero_n;
     calc_us = (DWT->CYCCNT - started) / (SystemCoreClock / 1000000U); // такты → мкс (168 тактов = 1 мкс)
     snap.blocks += pending;                         // счётчик обработанных блоков с запуска
     snap.calc_us_last = calc_us;                    // время этого расчёта
@@ -592,21 +738,45 @@ static void Coil_Fixed(char *out, size_t size, double value, uint32_t decimals, 
                  units / scale, (int)decimals, units % scale);
 }
 
+// Пометка об автообнулении в конец строки: идёт ожидание или накопление
+static void Coil_ZeroNote(char *out, size_t size, const CoilSnapshot *snap)
+{
+  if (snap->zero_state == COIL_ZERO_WAIT)
+  {
+    (void)snprintf(out, size, "  | zero: wait %lu s", snap->zero_left_s);
+  }
+  else if (snap->zero_state == COIL_ZERO_ACC)
+  {
+    (void)snprintf(out, size, "  | zero: %lu/%lu s", snap->zero_left_s, (uint32_t)(COIL_ZERO_AVG_S + 0.5));
+  }
+  else
+  {
+    out[0] = '\0';
+  }
+}
+
 // Печать снимка раз в 500 мс — только для человека, на расчёт не влияет:
 // Δt в мкс (демпф., ноль вычтен), расход в кг/мин, частота по набегу фазы
 static void Coil_PrintTask(void *argument)
 {
   CoilSnapshot snap;
   uint32_t wake;
+  uint32_t zero_printed = 0U;   // сколько нулей уже напечатано — новый печатается один раз
   char dt[16];
   char flow[16];
   char freq[16];
+  char sd[16];
+  char note[32];
 
   (void)argument;
+  Coil_Fixed(dt, sizeof(dt), COIL_ZERO_US, 4U, 1U);
   Coil_Send(snprintf(coil_text, sizeof(coil_text),
-                     "PWM_Kor: K1=PC1 K2=PC2, dt us (damped %lu ms, zero %ld ns), Q %s (K %lu.%03lu kg/min per us), f Hz (phase lock), A peak/rms mV\r\n",
-                     (uint32_t)(COIL_TAU_S * 1000.0), (int32_t)(COIL_ZERO_US * 1000.0), COIL_FLOW_UNIT_NAME,
+                     "PWM_Kor: K1=PC1 K2=PC2, dt us (average %lu ms, damped %lu ms), Q %s (K %lu.%03lu kg/min per us), f Hz, A peak/rms mV\r\n",
+                     (uint32_t)(COIL_AVG_USED_S * 1000.0), (uint32_t)(COIL_TAU_USED_S * 1000.0), COIL_FLOW_UNIT_NAME,
                      (uint32_t)(COIL_K_KGMIN_PER_US * 1000.0 + 0.5) / 1000U, (uint32_t)(COIL_K_KGMIN_PER_US * 1000.0 + 0.5) % 1000U));
+  Coil_Send(snprintf(coil_text, sizeof(coil_text),
+                     "zero %s us, auto zero: wait %lu s, average %lu s (0 - off)\r\n",
+                     dt, (uint32_t)(COIL_ZERO_DELAY_S + 0.5), (uint32_t)(COIL_ZERO_AVG_S + 0.5)));
   wake = osKernelGetTickCount();
   for (;;)
   {
@@ -615,21 +785,34 @@ static void Coil_PrintTask(void *argument)
     taskENTER_CRITICAL();
     snap = coil_snap;
     taskEXIT_CRITICAL();
+
+    // ноль только что записан — одна отдельная строка с его значением и разбросом
+    if (snap.zero_count != zero_printed)
+    {
+      zero_printed = snap.zero_count;
+      Coil_Fixed(dt, sizeof(dt), snap.zero_us, 4U, 1U);
+      Coil_Fixed(sd, sizeof(sd), snap.zero_sd_us, 4U, 0U);
+      Coil_Send(snprintf(coil_text, sizeof(coil_text),
+                         "ZERO = %s us (sd %s us, n=%lu)\r\n", dt, sd, snap.zero_n));
+      continue;
+    }
+
+    Coil_ZeroNote(note, sizeof(note), &snap);
     if (snap.valid == 0U)
     {
       Coil_Send(snprintf(coil_text, sizeof(coil_text),
-                         "dt=--- us  Q=0.000 %s  f=--- Hz  | no signal, K1 swing %lu mV\r\n",
-                         COIL_FLOW_UNIT_NAME, (uint32_t)lroundf(snap.swing_mv)));
+                         "dt=--- us  Q=0.000 %s  f=--- Hz  | no signal, K1 swing %lu mV%s\r\n",
+                         COIL_FLOW_UNIT_NAME, (uint32_t)lroundf(snap.swing_mv), note));
       continue;
     }
     Coil_Fixed(dt, sizeof(dt), snap.dt_shown_us, 4U, 1U);
     Coil_Fixed(flow, sizeof(flow), snap.flow_kgmin * COIL_FLOW_UNIT_FACTOR, 3U, 1U);
     Coil_Fixed(freq, sizeof(freq), snap.lock_hz, 3U, 0U);
     Coil_Send(snprintf(coil_text, sizeof(coil_text),
-                       "dt=%s us  Q=%s %s  f=%s Hz  | A1=%lu/%lu A2=%lu/%lu mV%s\r\n",
+                       "dt=%s us  Q=%s %s  f=%s Hz  | A1=%lu/%lu A2=%lu/%lu mV%s%s\r\n",
                        dt, flow, COIL_FLOW_UNIT_NAME, freq,
                        (uint32_t)lroundf(snap.amp1_mv), (uint32_t)lroundf(snap.rms1_mv),
                        (uint32_t)lroundf(snap.amp2_mv), (uint32_t)lroundf(snap.rms2_mv),
-                       (snap.clip1 + snap.clip2 != 0U) ? " CLIP" : ""));
+                       (snap.clip1 + snap.clip2 != 0U) ? " CLIP" : "", note));
   }
 }
