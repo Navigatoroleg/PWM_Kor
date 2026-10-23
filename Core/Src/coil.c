@@ -58,6 +58,8 @@ typedef struct
   float    freq_hz;
   float    amp1_mv;
   float    amp2_mv;
+  float    rms1_mv;       // действующее значение без постоянной составляющей, как «Амплитуда адаптера» Shtray Link
+  float    rms2_mv;
   int32_t  snr1_db;
   int32_t  snr2_db;
   double   lock_hz;       // частота по набегу фазы, сглаженная
@@ -191,53 +193,86 @@ static void Coil_Send(int length)
   }
 }
 
-// Новые точки К1 → уровень, полуразмах и переходы через уровень снизу вверх с гистерезисом 20 % полуразмаха.
-// Позиции переходов — в отсчётах с запуска, с линейной интерполяцией между точками
+// Детектор переходов К1 через уровень — первая, грубая оценка частоты трубки.
+// Вызывается на каждый блок DMA с новыми точками [from, to) — каждая точка К1 проходит здесь ровно один раз.
+// Делает три вещи:
+//   1) по новому блоку обновляет уровень (среднее) и полуразмах К1 — плавно, по блокам;
+//   2) ищет переходы К1 через уровень снизу вверх с гистерезисом COIL_HYST_FRACTION от полуразмаха;
+//   3) складывает позиции переходов в кольцо coil_cross из COIL_CROSS_KEEP последних.
+// Позиция перехода — дробный номер отсчёта с запуска: точка пересечения найдена линейной интерполяцией
+// между двумя соседними точками. По расстоянию между переходами Coil_Period считает точек на период,
+// а из него — окно подгонки синуса. Точную частоту потом даёт набег фазы в Coil_Calc
 static void Coil_TrackCrossings(uint32_t from, uint32_t to)
 {
-  float low = 1e9f;
-  float high = -1e9f;
-  float mean = 0.0f;
-  float cur;
-  float hyst;
-  uint32_t n;
+  float low = 1e9f;     // минимум К1 в новом блоке, коды АЦП
+  float high = -1e9f;   // максимум К1 в новом блоке
+  float mean = 0.0f;    // среднее К1 в новом блоке
+  float cur;            // текущая точка К1
+  float hyst;           // гистерезис: на сколько К1 должен уйти ниже уровня, чтобы следующий переход засчитался
+  uint32_t n;           // номер точки с запуска; в кольце — младшие биты (n & COIL_RING_MASK)
 
-  for (n = from; n < to; n++)
+  // --- 1. Уровень и размах К1 по новому блоку ---------------------------------------------------
+  // Блок — 64 точки, около 1,5 периода трубки при 120 Гц: минимум и максимум в нём попадают на пики
+  for (n = from; n < to; n++)                       // перебор новых точек блока
   {
-    cur = (float)coil_k1[n & COIL_RING_MASK];
-    mean += cur;
-    if (cur < low) { low = cur; }
-    if (cur > high) { high = cur; }
+    cur = (float)coil_k1[n & COIL_RING_MASK];       // точка К1 из кольца (накопленная сумма 16 отсчётов)
+    mean += cur;                                    // сумма для среднего
+    if (cur < low) { low = cur; }                   // минимум блока
+    if (cur > high) { high = cur; }                 // максимум блока
   }
-  mean /= (float)(to - from);
+  mean /= (float)(to - from);                       // среднее К1 по блоку
+
   if (coil_level_ready == 0U)
   {
-    coil_level = mean;
-    coil_half = (high - low) * 0.5f;
+    // Первый блок после запуска или после потери сигнала: берём значения блока как есть
+    coil_level = mean;                              // уровень — среднее первого блока
+    coil_half = (high - low) * 0.5f;                // полуразмах — половина размаха первого блока
+    // Предыдущая точка для поиска перехода — первая точка блока: на ней самой перехода не будет
     coil_prev = (float)coil_k1[from & COIL_RING_MASK];
-    coil_level_ready = 1U;
+    coil_level_ready = 1U;                          // дальше — только сглаживание
   }
   else
   {
-    coil_level += COIL_LEVEL_ALPHA * (mean - coil_level);
-    coil_half += COIL_LEVEL_ALPHA * ((high - low) * 0.5f - coil_half);
+    // Дальше — экспоненциальное сглаживание по блокам с коэффициентом COIL_LEVEL_ALPHA = 0,2:
+    // постоянная времени около 5 блоков (≈ 60 мс). Уровень не прыгает от шума одного блока,
+    // но успевает за медленным уходом смещения и изменением амплитуды
+    coil_level += COIL_LEVEL_ALPHA * (mean - coil_level);                 // уровень ← 20 % нового среднего
+    coil_half += COIL_LEVEL_ALPHA * ((high - low) * 0.5f - coil_half);    // полуразмах ← 20 % нового полуразмаха
   }
-  hyst = COIL_HYST_FRACTION * coil_half;
+  // Гистерезис — доля полуразмаха: при сигнале 470 мВ и доле 0,2 это около 94 мВ.
+  // Шум и иглы меньше этого не дают ложных переходов
+  hyst = COIL_HYST_FRACTION * coil_half;            // гистерезис в кодах АЦП
 
-  for (n = from; n < to; n++)
+  // --- 2. Переходы через уровень снизу вверх ------------------------------------------------------
+  // coil_prev и coil_armed живут между вызовами: переход на стыке двух блоков тоже не теряется
+  for (n = from; n < to; n++)                       // второй проход по тем же новым точкам
   {
-    cur = (float)coil_k1[n & COIL_RING_MASK];
+    cur = (float)coil_k1[n & COIL_RING_MASK];       // точка К1
+
+    // «Взвод»: сигнал ушёл ниже уровня на величину гистерезиса — следующий подъём через уровень
+    // будет настоящим переходом, а не дребезгом шума около уровня
     if (coil_prev < coil_level - hyst)
     {
-      coil_armed = 1U;
+      coil_armed = 1U;                              // детектор взведён
     }
+
+    // Переход засчитан: детектор взведён, предыдущая точка ниже уровня, текущая — на уровне или выше
     if ((coil_armed != 0U) && (coil_prev < coil_level) && (cur >= coil_level))
     {
+      // Точное место пересечения между точками n−1 и n — линейной интерполяцией:
+      //   доля = (уровень − prev) / (cur − prev), от 0 до 1;
+      //   позиция = (n − 1) + доля, в отсчётах с запуска.
+      // Так период меряется точнее одного отсчёта (200 мкс при 5 кГц).
+      // double — потому что номер отсчёта растёт без ограничения, а float держит только 7 значащих цифр
       coil_cross[coil_cross_count % COIL_CROSS_KEEP] =
         (double)(n - 1U) + (double)((coil_level - coil_prev) / (cur - coil_prev));
+      // Счётчик всех переходов с запуска; в кольце из COIL_CROSS_KEEP хранятся только последние
       coil_cross_count++;
+      // Сброс взвода: следующий переход засчитается, только когда сигнал снова опустится ниже уровня − гистерезис
       coil_armed = 0U;
     }
+
+    // Текущая точка становится предыдущей — и для следующей точки, и для первой точки следующего блока
     coil_prev = cur;
   }
 }
@@ -457,6 +492,8 @@ static void Coil_Calc(uint32_t end, uint32_t steps, CoilSnapshot *snap)
   snap->freq_hz = (float)freq;
   snap->amp1_mv = (float)(amp1 * mv_per_code);
   snap->amp2_mv = (float)(amp2 * mv_per_code);
+  snap->rms1_mv = (float)(sqrt(f1.power) * mv_per_code);
+  snap->rms2_mv = (float)(sqrt(f2.power) * mv_per_code);
   snap->snr1_db = snr1;
   snap->snr2_db = snr2;
   snap->dt_us = dt_us;
@@ -467,64 +504,75 @@ static void Coil_Calc(uint32_t end, uint32_t steps, CoilSnapshot *snap)
 // Расчёт на каждый блок DMA: будит прерывание, шаг 12,8 мс от кварца таймера
 static void Coil_CalcTask(void *argument)
 {
-  CoilSnapshot snap;
-  uint32_t pending;
-  uint32_t end;
-  uint32_t started;
-  uint32_t calc_us;
+  CoilSnapshot snap;    // свой снимок результатов; наружу копируется целиком в конце каждого прохода
+  uint32_t pending;     // сколько блоков DMA пришло с прошлого прохода (обычно 1)
+  uint32_t end;         // номер точки, до которой есть данные (не включая её)
+  uint32_t started;     // такты ядра в начале расчёта — для замера времени
+  uint32_t calc_us;     // время расчёта этого прохода, мкс
 
-  (void)argument;
-  memset(&snap, 0, sizeof(snap));
-  // τ = 0 — без сглаживания: коэффициент 1
-  coil_alpha = (COIL_TAU_S > 0.0) ? 1.0 - exp(-COIL_BLOCK_S / COIL_TAU_S) : 1.0;
-  coil_freq_alpha = (COIL_FREQ_TAU_S > 0.0) ? 1.0 - exp(-COIL_BLOCK_S / COIL_FREQ_TAU_S) : 1.0;
-  // счётчик тактов ядра для замера времени расчёта
-  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-  DWT->CYCCNT = 0U;
-  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+  (void)argument;                                   // параметр задачи не используется
+  memset(&snap, 0, sizeof(snap));                   // счётчики и результаты — с нуля
 
-  // ADC2 — ведомый, его запускает ADC1. Порядок: ADC2, затем ADC1 с DMA, затем таймер
-  // TIM2 = COIL_FS_HZ × COIL_OS. Таймеры APB1 тактируются удвоенной PCLK1, когда делитель APB1 не 1
-  __HAL_TIM_SET_AUTORELOAD(&htim2, (2U * HAL_RCC_GetPCLK1Freq()) / (COIL_FS_HZ * COIL_OS) - 1U);
-  (void)HAL_ADC_Start(&hadc2);
-  (void)HAL_ADCEx_MultiModeStart_DMA(&hadc1, coil_dma, COIL_DMA_WORDS);
-  (void)HAL_TIM_Base_Start(&htim2);
+  // --- Подготовка: один раз при старте --------------------------------------------------------
+  // Коэффициенты экспоненциального сглаживания на ОДИН блок (12,8 мс): α = 1 − e^(−T/τ).
+  // Считаются один раз — дальше шаг демпфирования строго одинаковый. τ = 0 — без сглаживания: α = 1
+  coil_alpha = (COIL_TAU_S > 0.0) ? 1.0 - exp(-COIL_BLOCK_S / COIL_TAU_S) : 1.0;              // для Δt
+  coil_freq_alpha = (COIL_FREQ_TAU_S > 0.0) ? 1.0 - exp(-COIL_BLOCK_S / COIL_FREQ_TAU_S) : 1.0; // для частоты
 
+  // Счётчик тактов ядра DWT CYCCNT: 168 МГц, по нему меряется время расчёта
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;   // разрешить блок трассировки, в нём DWT
+  DWT->CYCCNT = 0U;                                 // обнулить счётчик тактов
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;              // запустить счётчик тактов
+
+  // Запуск оцифровки. Порядок важен: ADC2 — ведомый, его запускает ADC1; ADC1 ждёт триггер от TIM2
+  // TIM2 = COIL_FS_HZ × COIL_OS (80 кГц). Таймеры APB1 тактируются удвоенной PCLK1 (42 → 84 МГц), когда делитель APB1 не 1
+  __HAL_TIM_SET_AUTORELOAD(&htim2, (2U * HAL_RCC_GetPCLK1Freq()) / (COIL_FS_HZ * COIL_OS) - 1U); // 84 МГц / 80 кГц − 1 = 1049
+  (void)HAL_ADC_Start(&hadc2);                                          // включить ADC2, он ждёт ADC1
+  (void)HAL_ADCEx_MultiModeStart_DMA(&hadc1, coil_dma, COIL_DMA_WORDS); // ADC1 + DMA в кольцо coil_dma, ждёт TIM2
+  (void)HAL_TIM_Base_Start(&htim2);                                     // пошли запуски — данные текут сами
+
+  // --- Основной цикл: один проход на каждый блок DMA (64 точки = 12,8 мс) -----------------------
   for (;;)
   {
+    // Ждать уведомления из прерывания DMA (Coil_Accumulate → vTaskNotifyGiveFromISR).
+    // Пока ждём — процессор свободен. pdTRUE: забрать все накопившиеся уведомления сразу и обнулить счётчик.
+    // Возвращает их число: 1 — норма, больше 1 — расчёт не успел к прошлому блоку, 0 — тайм-аут 100 мс
     pending = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100U));
     if (pending == 0U)
     {
-      // за 100 мс ни одного блока: DMA или таймер стоят
+      // за 100 мс ни одного блока: стоят DMA или таймер. Просто ждём дальше
       continue;
     }
-    started = DWT->CYCCNT;
-    end = coil_head;
+    started = DWT->CYCCNT;                          // засечка тактов: начало расчёта
+    end = coil_head;                                // до какой точки дописал DMA; читается один раз — дальше работаем с этим значением
     if (pending > 1U)
     {
-      snap.missed += pending - 1U;
-      snap.missed_at = snap.blocks + pending;
+      snap.missed += pending - 1U;                  // сколько блоков пропущено (обработаются вместе с этим)
+      snap.missed_at = snap.blocks + pending;       // номер блока, на котором отстали — для диагностики
     }
     if (end - coil_done > COIL_RING / 2U)
     {
-      // отстали больше чем на полкольца — детектор начинает заново
-      coil_done = end - COIL_BLOCK;
-      coil_level_ready = 0U;
-      coil_cross_count = 0U;
+      // Отстали больше чем на полкольца (0,8 с): старые точки уже перезаписаны DMA.
+      // Детектор переходов начинает заново с последнего блока, чтобы не читать испорченные данные
+      coil_done = end - COIL_BLOCK;                 // взять только последний блок
+      coil_level_ready = 0U;                        // уровень и размах — заново
+      coil_cross_count = 0U;                        // старые переходы забыть
     }
-    Coil_TrackCrossings(coil_done, end);
-    coil_done = end;
-    Coil_Calc(end, pending, &snap);
-    calc_us = (DWT->CYCCNT - started) / (SystemCoreClock / 1000000U);
-    snap.blocks += pending;
-    snap.calc_us_last = calc_us;
+    Coil_TrackCrossings(coil_done, end);            // новые точки К1 → уровень, размах, переходы через ноль
+    coil_done = end;                                // эти точки обработаны
+    Coil_Calc(end, pending, &snap);                 // частота, подгонка синуса К1/К2, Δt, демпфирование, расход → snap
+    calc_us = (DWT->CYCCNT - started) / (SystemCoreClock / 1000000U); // такты → мкс (168 тактов = 1 мкс)
+    snap.blocks += pending;                         // счётчик обработанных блоков с запуска
+    snap.calc_us_last = calc_us;                    // время этого расчёта
     if (calc_us > snap.calc_us_max)
     {
-      snap.calc_us_max = calc_us;
+      snap.calc_us_max = calc_us;                   // худшее время с запуска; бюджет — 12 800 мкс на блок
     }
-    taskENTER_CRITICAL();
-    coil_snap = snap;
-    taskEXIT_CRITICAL();
+    // Отдать снимок задаче печати. Критическая секция — чтобы печать не прочитала снимок
+    // наполовину старым, наполовину новым: копирование ~120 байт занимает микросекунды
+    taskENTER_CRITICAL();                           // запретить прерывания и переключение задач
+    coil_snap = snap;                               // скопировать весь снимок
+    taskEXIT_CRITICAL();                            // разрешить обратно
   }
 }
 
@@ -556,7 +604,7 @@ static void Coil_PrintTask(void *argument)
 
   (void)argument;
   Coil_Send(snprintf(coil_text, sizeof(coil_text),
-                     "PWM_Kor: K1=PC1 K2=PC2, dt us (damped %lu ms, zero %ld ns), Q %s (K %lu.%03lu kg/min per us), f Hz (phase lock)\r\n",
+                     "PWM_Kor: K1=PC1 K2=PC2, dt us (damped %lu ms, zero %ld ns), Q %s (K %lu.%03lu kg/min per us), f Hz (phase lock), A peak/rms mV\r\n",
                      (uint32_t)(COIL_TAU_S * 1000.0), (int32_t)(COIL_ZERO_US * 1000.0), COIL_FLOW_UNIT_NAME,
                      (uint32_t)(COIL_K_KGMIN_PER_US * 1000.0 + 0.5) / 1000U, (uint32_t)(COIL_K_KGMIN_PER_US * 1000.0 + 0.5) % 1000U));
   wake = osKernelGetTickCount();
@@ -578,10 +626,10 @@ static void Coil_PrintTask(void *argument)
     Coil_Fixed(flow, sizeof(flow), snap.flow_kgmin * COIL_FLOW_UNIT_FACTOR, 3U, 1U);
     Coil_Fixed(freq, sizeof(freq), snap.lock_hz, 3U, 0U);
     Coil_Send(snprintf(coil_text, sizeof(coil_text),
-                       "dt=%s us  Q=%s %s  f=%s Hz  | A1=%lu A2=%lu mV snr=%ld/%ld dB%s\r\n",
+                       "dt=%s us  Q=%s %s  f=%s Hz  | A1=%lu/%lu A2=%lu/%lu mV%s\r\n",
                        dt, flow, COIL_FLOW_UNIT_NAME, freq,
-                       (uint32_t)lroundf(snap.amp1_mv), (uint32_t)lroundf(snap.amp2_mv),
-                       snap.snr1_db, snap.snr2_db,
+                       (uint32_t)lroundf(snap.amp1_mv), (uint32_t)lroundf(snap.rms1_mv),
+                       (uint32_t)lroundf(snap.amp2_mv), (uint32_t)lroundf(snap.rms2_mv),
                        (snap.clip1 + snap.clip2 != 0U) ? " CLIP" : ""));
   }
 }
